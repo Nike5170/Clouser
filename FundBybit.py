@@ -10,7 +10,7 @@ from datetime import datetime
 API_KEY    = "TKCSBRh0oWIXaS3SC0"
 API_SECRET = "MgAq2McTsjs4w1iwpGKyRRynWe5BGNUo61m9"
 SYMBOL     = "ENSOUSDT"         # пример пары
-QTY        = 10                 # пример объём
+QTY        = 4                 # пример объём
 BASE       = "https://api.bybit.com"
 WS_PRIVATE = "wss://stream.bybit.com/v5/private"  # WebSocket приватный поток для аккаунта :contentReference[oaicite:1]{index=1}
 WS_MARKET  = f"wss://stream.bybit.com/v5/public/linear/funding-and-index?symbol={SYMBOL}"  # пример публичного потока по фонду или funding-информация
