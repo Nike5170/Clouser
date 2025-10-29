@@ -72,7 +72,7 @@ async def schedule_entry(session, next_T):
 async def run():
     async with aiohttp.ClientSession() as session:
         # Получаем текущий funding через REST
-        res = await signed_req(session, "GET", "/v5/market/funding/prev-funding-rate", {"category": "linear", "symbol": SYMBOL})
+        res = await signed_req(session, "GET", "/v5/market/funding/prev-funding", {"category": "linear", "symbol": SYMBOL})
         item = res.get("result", {}).get("list", [{}])[0]
         next_funding = int(item.get("fundingTimestamp", int(time.time() * 1000)))
         entry_task = asyncio.create_task(schedule_entry(session, next_funding))
