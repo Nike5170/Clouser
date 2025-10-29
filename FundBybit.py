@@ -96,7 +96,7 @@ async def run():
             log(f"[WS] Connected public stream for {SYMBOL}")
             await ws_mark.send_json({
                 "op": "subscribe",
-                "args": [f"funding_rate.{SYMBOL}"]
+                "args": [f"funding_rate_linear.{SYMBOL}"]
             })
 
             async for msg in ws_mark:
