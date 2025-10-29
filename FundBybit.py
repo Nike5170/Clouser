@@ -15,9 +15,9 @@ BASE       = "https://api.bybit.com"
 WS_PRIVATE = "wss://stream.bybit.com/v5/private"  # приватный поток
 WS_PUBLIC  = "wss://stream.bybit.com/v5/public/linear"  # публичный поток (исправлено)
 
-ENTRY_THRESHOLD = -0.01
+#ENTRY_THRESHOLD = -0.01
 CHECK_WINDOW_MS = 30000
-ENTRY_OFFSET_MS = 200
+ENTRY_OFFSET_MS = 50
 
 def log(msg):
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -75,16 +75,25 @@ async def account_ws(session, funding_event):
                 if not funding_event.is_set():
                     funding_event.set()
 
+async def schedule_entry(session, next_T):
+    """Асинхронная задача для точного открытия позиции один раз"""
+    now = int(time.time() * 1000)
+    delay = max(0, (next_T - ENTRY_OFFSET_MS - now) / 1000.0)
+    log(f"[TIMER] Waiting {delay*1000:.0f} ms until entry")
+    await asyncio.sleep(delay)
+    log(f"[ENTRY] MARKET BUY {QTY}")
+    await market_order(session, "Buy", QTY)
+
 async def run():
     funding_event = asyncio.Event()
     async with aiohttp.ClientSession() as session:
         account_task = asyncio.create_task(account_ws(session, funding_event))
+        entry_task = None
         entered = False
+        timer_started = False  # флаг, чтобы таймер создавался только один раз
 
-        # Подключаемся к публичному WS
         async with session.ws_connect(WS_PUBLIC) as ws_mark:
             log(f"[WS] Connected public stream for {SYMBOL}")
-            # Подписка на funding rate канала
             await ws_mark.send_json({
                 "op": "subscribe",
                 "args": [f"funding_rate.{SYMBOL}"]
@@ -94,30 +103,24 @@ async def run():
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
                 d = json.loads(msg.data)
-                # Проверяем структуру данных
-                # Bybit v5 funding_rate: {"topic": "funding_rate.ENSOUSDT", "data": [{"fundingRate": "...", "nextFundingTime": "..."}]}
                 if "data" not in d:
                     continue
 
                 for entry in d["data"]:
-                    rate = float(entry.get("fundingRate", 0))
                     next_T = int(entry.get("nextFundingTime", 0))
                     now = int(time.time() * 1000)
                     ms_to_funding = next_T - now
 
-                    log(f"[MARKET_STREAM] rate={rate:.6f}, nextFunding={next_T}, ms_to_funding={ms_to_funding}")
+                    log(f"[MARKET_STREAM] nextFunding={next_T}, ms_to_funding={ms_to_funding}")
 
-                    if (not entered) and (rate <= ENTRY_THRESHOLD) and (0 < ms_to_funding <= CHECK_WINDOW_MS):
-                        entry_time = next_T - ENTRY_OFFSET_MS
-                        delay = max(0, (entry_time - now) / 1000.0)
-                        log(f"[READY] rate={rate:.6f}, entry in {delay*1000:.0f} ms")
-                        await asyncio.sleep(delay)
-                        log(f"[ENTRY] MARKET BUY {QTY}")
-                        await market_order(session, "Buy", QTY)
+                    # Создаём таймер на открытие позиции только один раз
+                    if not timer_started:
+                        entry_task = asyncio.create_task(schedule_entry(session, next_T))
+                        timer_started = True
                         entered = True
 
-                    if entered and funding_event.is_set():
-                        funding_event.clear()
+                    # Закрытие позиции сразу, когда ms_to_funding < 0
+                    if entered and ms_to_funding < 0:
                         pos = await get_position(session)
                         log(f"[POSITION] size={pos}")
                         if pos != 0:
@@ -127,8 +130,11 @@ async def run():
                         else:
                             log("[EXIT] No position to close")
                         entered = False
+                        if entry_task:
+                            entry_task.cancel()
+                            entry_task = None
 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.01)
 
         await account_task
 
