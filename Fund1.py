@@ -10,7 +10,6 @@ BASE       = "https://fapi.binance.com"
 WS_MARK    = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@markPrice@1s"
 ENTRY_OFFSET_MS = 200
 CHECK_WINDOW_MS = 30000
-FUNDING_LIMIT   = -0.01
 
 def log(msg):
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -42,7 +41,14 @@ async def current_pos(session):
     d = await signed_req(session, "GET", "/fapi/v2/positionRisk", {"symbol": SYMBOL})
     try:
         return float(d[0]["positionAmt"])
-    except: return 0.0
+    except:
+        return 0.0
+
+async def funding_info(session):
+    d = await signed_req(session, "GET", "/fapi/v1/premiumIndex", {"symbol": SYMBOL})
+    funding_rate = float(d.get("lastFundingRate", 0))
+    next_funding = int(d.get("nextFundingTime", 0))
+    return funding_rate, next_funding
 
 async def get_listen_key(session):
     headers = {"X-MBX-APIKEY": API_KEY}
@@ -59,62 +65,57 @@ async def account_ws(listen_key, funding_event):
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
                 data = json.loads(msg.data)
-                log(f"[ACCOUNT_WS] {data}")
                 if data.get("e") == "ACCOUNT_UPDATE" and data["a"].get("m") == "FUNDING_FEE":
-                    log("[EVENT] FUNDING_FEE received")
+                    log(f"[EVENT] FUNDING_FEE received: {data['a']['B']}")
                     funding_event.set()  # сигнал для основного потока
 
 async def run():
     funding_event = asyncio.Event()
     async with aiohttp.ClientSession() as session:
+        # Показываем информацию о следующем funding сразу
+        rate, next_funding = await funding_info(session)
+        next_dt = datetime.utcfromtimestamp(next_funding / 1000).strftime("%Y-%m-%d %H:%M:%S")
+        log(f"[INFO] Next funding time: {next_dt}, funding rate: {rate:.6f}")
+
         listen_key = await get_listen_key(session)
         asyncio.create_task(account_ws(listen_key, funding_event))
 
         async with session.ws_connect(WS_MARK) as ws:
             log(f"[WS] Connected markPrice for {SYMBOL}")
             entered = False
-            entry_rate = None
-            entry_T = None
+            entry_T = next_funding  # будем заходить прямо перед funding
 
             async for msg in ws:
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
                 d = json.loads(msg.data)
-                rate = float(d["r"])
                 next_T = int(d["T"])
                 now = int(time.time() * 1000)
-                ms_to_funding = next_T - now
+                ms_to_funding = entry_T - now
 
                 # логируем markPrice в ±2 секунды от funding
                 if abs(ms_to_funding) <= 2000:
-                    log(f"[MARKPRICE] rate={rate:.4%}, nextFunding={next_T}, ms_to_funding={ms_to_funding}")
+                    rate = float(d["r"])
+                    log(f"[MARKPRICE] rate={rate:.4%}, nextFunding={entry_T}, ms_to_funding={ms_to_funding}")
 
-                if not entered and rate <= FUNDING_LIMIT and 0 < ms_to_funding <= CHECK_WINDOW_MS:
-                    entry_time = next_T - ENTRY_OFFSET_MS
-                    delay = max(0, (entry_time - now) / 1000)
-                    log(f"[READY] rate={rate:.4%}, entry in {delay*1000:.0f} ms")
+                # Входим в позицию прямо перед funding
+                if not entered and 0 < ms_to_funding <= CHECK_WINDOW_MS:
+                    delay = max(0, (entry_T - ENTRY_OFFSET_MS - now) / 1000)
+                    log(f"[READY] entry in {delay*1000:.0f} ms")
                     await asyncio.sleep(delay)
                     log(f"[ENTRY] MARKET BUY {QTY}")
                     await market_order(session, "BUY", QTY)
-                    entered, entry_rate, entry_T = True, rate, next_T
+                    entered = True
 
-                # после начисления funding ждем сигнал FUNDING_FEE
-                if entered and entry_T and funding_event.is_set():
+                # После начисления funding сразу закрываем сделку
+                if entered and funding_event.is_set():
                     funding_event.clear()
                     pos = await current_pos(session)
-                    if pos == 0:
-                        entered = False
-                        continue
-                    new_rate = rate
-                    if new_rate > entry_rate:
-                        log(f"[EXIT] Funding improved ({entry_rate:.4%}->{new_rate:.4%}) closing...")
+                    if pos != 0:
                         side = "SELL" if pos > 0 else "BUY"
                         await market_order(session, side, abs(pos), reduce=True)
-                        entered = False
-                        entry_rate = None
-                        entry_T = None
-                    else:
-                        log(f"[HOLD] Funding not improved ({entry_rate:.4%}->{new_rate:.4%}) waiting manual close")
+                        log(f"[EXIT] Position closed immediately after funding")
+                    entered = False
 
                 await asyncio.sleep(0.1)
 
