@@ -9,7 +9,7 @@ QTY        = 10
 BASE       = "https://fapi.binance.com"
 WS_MARK    = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@markPrice@1s"
 
-ENTRY_OFFSET_MS = 50       # вход за 50 мс до funding
+ENTRY_OFFSET_MS = 100       # вход за 100 мс до funding
 CHECK_WINDOW_MS = 30000    # проверяем только 30 секунд до события
 
 # -------------------- ЛОГ --------------------

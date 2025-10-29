@@ -9,15 +9,13 @@ from datetime import datetime
 
 API_KEY    = "TKCSBRh0oWIXaS3SC0"
 API_SECRET = "MgAq2McTsjs4w1iwpGKyRRynWe5BGNUo61m9"
-SYMBOL     = "ENSOUSDT"         # пример пары
-QTY        = 4                  # пример объём
+SYMBOL     = "ENSOUSDT"
+QTY        = 4
 BASE       = "https://api.bybit.com"
-WS_PRIVATE = "wss://stream.bybit.com/v5/private"  # приватный поток
-WS_PUBLIC  = "wss://stream.bybit.com/v5/public/linear"  # публичный поток (исправлено)
+WS_PUBLIC  = "wss://stream.bybit.com/v5/public/linear"
 
-#ENTRY_THRESHOLD = -0.01
-CHECK_WINDOW_MS = 30000
 ENTRY_OFFSET_MS = 50
+LOG_WINDOW_MS   = 2000  # 2 секунды до и после фандинга
 
 def log(msg):
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -40,7 +38,7 @@ async def signed_req(session, method, path, params=None):
             raise Exception(f"HTTP {r.status}: {text}")
         return json.loads(text)
 
-async def market_order(session, side, qty):
+async def market_order(session, side, qty, reduce=False):
     body = {
         "category": "linear",
         "symbol": SYMBOL,
@@ -48,8 +46,9 @@ async def market_order(session, side, qty):
         "orderType": "Market",
         "qty": str(qty),
         "timeInForce": "ImmediateOrCancel",
-        "reduceOnly": False
+        "reduceOnly": reduce
     }
+    log(f"[SEND] MARKET {side} {qty} (reduceOnly={reduce})")
     res = await signed_req(session, "POST", "/v5/order/create", body)
     log(f"[ORDER] {side} {qty}: {res}")
     return res
@@ -62,81 +61,61 @@ async def get_position(session):
             return float(p.get("size", 0)) * (1 if p.get("side") == "Buy" else -1)
     return 0.0
 
-async def account_ws(session, funding_event):
-    async with session.ws_connect(WS_PRIVATE) as ws:
-        log("[WS] Connected account private stream")
-        async for msg in ws:
-            if msg.type != aiohttp.WSMsgType.TEXT:
-                continue
-            data = json.loads(msg.data)
-            log(f"[ACCOUNT_WS] {data}")
-            if data.get("topic", "").startswith("funding") or data.get("type") == "funding":
-                log("[EVENT] FUNDING received")
-                if not funding_event.is_set():
-                    funding_event.set()
-
 async def schedule_entry(session, next_T):
-    """Асинхронная задача для точного открытия позиции один раз"""
     now = int(time.time() * 1000)
     delay = max(0, (next_T - ENTRY_OFFSET_MS - now) / 1000.0)
-    log(f"[TIMER] Waiting {delay*1000:.0f} ms until entry")
+    log(f"[READY] Entry in {delay*1000:.0f} ms")
     await asyncio.sleep(delay)
     log(f"[ENTRY] MARKET BUY {QTY}")
     await market_order(session, "Buy", QTY)
 
 async def run():
-    funding_event = asyncio.Event()
     async with aiohttp.ClientSession() as session:
-        account_task = asyncio.create_task(account_ws(session, funding_event))
-        entry_task = None
-        entered = False
-        timer_started = False  # флаг, чтобы таймер создавался только один раз
+        # Получаем текущий funding через REST
+        res = await signed_req(session, "GET", "/v5/market/funding/prev-funding-rate", {"category": "linear", "symbol": SYMBOL})
+        item = res.get("result", {}).get("list", [{}])[0]
+        next_funding = int(item.get("fundingTimestamp", int(time.time() * 1000)))
+        entry_task = asyncio.create_task(schedule_entry(session, next_funding))
+        entered = True
 
-        async with session.ws_connect(WS_PUBLIC) as ws_mark:
+        async with session.ws_connect(WS_PUBLIC) as ws:
             log(f"[WS] Connected public stream for {SYMBOL}")
-            await ws_mark.send_json({
+            await ws.send_json({
                 "op": "subscribe",
                 "args": [f"funding_rate_linear.{SYMBOL}"]
             })
 
-            async for msg in ws_mark:
+            async for msg in ws:
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
-                d = json.loads(msg.data)
-                if "data" not in d:
+                data = json.loads(msg.data)
+                if "data" not in data:
                     continue
 
-                for entry in d["data"]:
+                for entry in data["data"]:
                     next_T = int(entry.get("nextFundingTime", 0))
                     now = int(time.time() * 1000)
                     ms_to_funding = next_T - now
 
-                    log(f"[MARKET_STREAM] nextFunding={next_T}, ms_to_funding={ms_to_funding}")
+                    # Логи за 2 сек до и после funding
+                    if abs(ms_to_funding) <= LOG_WINDOW_MS:
+                        rate = float(entry.get("fundingRate", 0))
+                        log(f"[MARKPRICE] rate={rate:.6%}, nextFunding={next_T}, ms_to_funding={ms_to_funding}")
 
-                    # Создаём таймер на открытие позиции только один раз
-                    if not timer_started:
-                        entry_task = asyncio.create_task(schedule_entry(session, next_T))
-                        timer_started = True
-                        entered = True
-
-                    # Закрытие позиции сразу, когда ms_to_funding < 0
+                    # Мгновенное закрытие позиции после funding
                     if entered and ms_to_funding < 0:
                         pos = await get_position(session)
-                        log(f"[POSITION] size={pos}")
                         if pos != 0:
                             side = "Sell" if pos > 0 else "Buy"
-                            log(f"[EXIT] Closing position {pos} via {side}")
-                            await market_order(session, side, abs(pos))
-                        else:
-                            log("[EXIT] No position to close")
+                            log(f"[CLOSE_TRIGGER] Closing position {pos} via {side}")
+                            await market_order(session, side, abs(pos), reduce=True)
+                            log("[EXIT] Position closed immediately after funding")
                         entered = False
                         if entry_task:
                             entry_task.cancel()
                             entry_task = None
 
                 await asyncio.sleep(0.01)
-
-        await account_task
 
 if __name__ == "__main__":
     try:

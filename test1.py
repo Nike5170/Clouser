@@ -395,12 +395,15 @@ async def telegram_command_listener():
                         elif text == "/stop":
                             task = user_tasks.pop(chat_id, None)
                             if task:
+                                await send_telegram_message(chat_id, "🛑 Останавливаю обработку...")
                                 task.cancel()
-                                await send_telegram_message(chat_id, "🛑 Обработка остановлена.")
+                                try:
+                                    await task  # дождаться корректной очистки
+                                except asyncio.CancelledError:
+                                    pass
+                                await send_telegram_message(chat_id, "✅ Обработка полностью остановлена и очищена.")
                             else:
-                                if chat_id in user_tasks:
-                                    await send_telegram_message(chat_id, "⚠️ Обработка ещё не была запущена.")
-
+                                await send_telegram_message(chat_id, "⚠️ Обработка ещё не была запущена.")
                         else: 
                             for api in API_KEYS:
                                 if api["tg_id"] == chat_id:
@@ -418,18 +421,39 @@ async def handle_api_for_user(api_key, api_secret, tg_id):
     queue = asyncio.Queue()
 
     # Устанавливаем tg_id в контекст
-    token = current_tg_id.set(tg_id)
+    token_tg = current_tg_id.set(tg_id)
     token_positions = positions_data_var.set({})
 
+    # Запускаем обе задачи Binance
+    producer_task = asyncio.create_task(websocket_message_producer(client, queue, logger))
+    handler_task = asyncio.create_task(handle_private_messages(queue, client, logger))
+
     try:
-        await asyncio.gather(
-            websocket_message_producer(client, queue, logger),
-            handle_private_messages(queue, client, logger),
-        )
+        await logger.log(f"🚀 Запущена обработка для пользователя {tg_id}.")
+        await asyncio.gather(producer_task, handler_task)
+    except asyncio.CancelledError:
+        # Получили отмену через /stop
+        await logger.log(f"🛑 Получен сигнал остановки для пользователя {tg_id}.", tg_id)
     finally:
-        current_tg_id.reset(token)
-        positions_data_var.reset(token_positions)
-        await client.session.close()
+        # Отменяем обе задачи и ждём завершения
+        for t in [producer_task, handler_task]:
+            t.cancel()
+        await asyncio.gather(producer_task, handler_task, return_exceptions=True)
+
+        # Закрываем соединение с Binance
+        try:
+            await client.close_connection()
+        except Exception:
+            try:
+                await client.session.close()
+            except Exception:
+                pass
+
+        # Чистим контексты и позиции
+        positions_data_var.set({})
+        current_tg_id.set(None)
+
+        await logger.log(f"✅ Пользователь {tg_id} полностью остановлен и очищен.", tg_id)
         
 def get_positions_data():
     return positions_data_var.get()
