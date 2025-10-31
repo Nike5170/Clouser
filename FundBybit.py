@@ -55,7 +55,7 @@ async def market_order(session, side, qty, reduce=False):
 
 async def get_position(session):
     body = {"category": "linear", "symbol": SYMBOL}
-    res = await signed_req(session, "GET", "/v5/position/list", body)
+    res = await signed_req(session, "GET", "/v5/position/list", params={"category": "linear", "symbol": SYMBOL})
     for p in res.get("result", {}).get("list", []):
         if p.get("symbol") == SYMBOL:
             return float(p.get("size", 0)) * (1 if p.get("side") == "Buy" else -1)
@@ -76,7 +76,7 @@ async def run():
             session,
             "GET",
             "/v5/market/funding/prev-funding-rate",
-            {"category": "linear", "symbol": SYMBOL}
+            params={"category": "linear", "symbol": SYMBOL}
         )
         item = res.get("result", {}).get("list", [{}])[0]
         next_funding = int(item.get("fundingTimestamp", int(time.time() * 1000)))
@@ -84,10 +84,9 @@ async def run():
         entered = True
 
         async with session.ws_connect(WS_PUBLIC) as ws:
-            log(f"[WS] Connected public stream for {SYMBOL}")
             await ws.send_json({
                 "op": "subscribe",
-                "args": [f"funding_rate_linear.{SYMBOL}"]
+                "args": [f"funding_rate.{SYMBOL}"]
             })
 
             async for msg in ws:
