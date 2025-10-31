@@ -9,8 +9,8 @@ from datetime import datetime
 
 API_KEY    = "TKCSBRh0oWIXaS3SC0"
 API_SECRET = "MgAq2McTsjs4w1iwpGKyRRynWe5BGNUo61m9"
-SYMBOL     = "ENSOUSDT"
-QTY        = 4
+SYMBOL     = "ICNTUSDT"
+QTY        = 15
 BASE       = "https://api.bybit.com"
 WS_PUBLIC  = "wss://stream.bybit.com/v5/public/linear"
 
